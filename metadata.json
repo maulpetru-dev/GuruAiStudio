@@ -1,0 +1,6 @@
+{
+  "name": "GuruAI Studio",
+  "description": "Asisten AI profesional untuk guru madrasah dan sekolah nasional dalam menyusun perangkat pembelajaran Kurikulum Merdeka yang kohesif, adaptif, dan siap ekspor DOCX.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

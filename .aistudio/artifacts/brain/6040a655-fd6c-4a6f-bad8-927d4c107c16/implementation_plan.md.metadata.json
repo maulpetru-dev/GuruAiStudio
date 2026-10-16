@@ -1,0 +1,6 @@
+{
+  "summary": "Rencana implementasi GuruAI Studio v0.1: Asisten AI terpadu untuk guru menyusun Modul Ajar Kurikulum Merdeka yang kohesif (Tujuan, Pemantik, Materi, LKPD, Asesmen Formatif/Sumatif, Rubrik, Outline Presentasi, Refleksi), dilengkapi editor per bagian, konsistensi evaluator, asisten kontekstual, penyimpanan IndexedDB/LocalStorage, dan ekspor DOCX terformat rapi.",
+  "updatedAt": "2026-10-16T19:27:43.011842966Z",
+  "requestFeedback": true,
+  "userFacing": true
+}
