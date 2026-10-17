@@ -10,15 +10,85 @@ dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json({ limit: '10mb' }));
+// Enforce request body size limit to avoid memory exhaustion attacks
+app.use(express.json({ limit: '2mb' }));
 
-// Initialize GoogleGenAI client
+// ============================================================================
+// RATE LIMITING (In-Memory sliding-window rate limiter without extra dependencies)
+// ============================================================================
+interface RateLimitConfig {
+  windowMs: number;
+  maxRequests: number;
+  message: string;
+}
+
+function createRateLimiter(config: RateLimitConfig) {
+  const hits = new Map<string, { count: number; resetTime: number }>();
+
+  // Cleanup expired entries periodically to prevent memory leaks
+  const interval = setInterval(() => {
+    const now = Date.now();
+    for (const [ip, entry] of hits.entries()) {
+      if (entry.resetTime <= now) {
+        hits.delete(ip);
+      }
+    }
+  }, 2 * 60 * 1000);
+  interval.unref();
+
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const rawIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    const clientIp = Array.isArray(rawIp)
+      ? rawIp[0]
+      : typeof rawIp === 'string'
+      ? rawIp.split(',')[0].trim()
+      : 'unknown';
+
+    const now = Date.now();
+    const entry = hits.get(clientIp);
+
+    if (!entry || entry.resetTime <= now) {
+      hits.set(clientIp, { count: 1, resetTime: now + config.windowMs });
+      return next();
+    }
+
+    entry.count += 1;
+    if (entry.count > config.maxRequests) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((entry.resetTime - now) / 1000));
+      res.setHeader('Retry-After', retryAfterSeconds);
+      return res.status(429).json({
+        error: config.message,
+        retryAfter: retryAfterSeconds,
+      });
+    }
+
+    next();
+  };
+}
+
+// 1. Strict limit for full-package generation (heavy AI invocation)
+const packageGenerateLimiter = createRateLimiter({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  maxRequests: 20, // Max 20 package generations per 10 minutes per IP
+  message: 'Batas pembuatan paket modul ajar terlampaui. Mohon tunggu beberapa menit sebelum membuat paket baru.',
+});
+
+// 2. Standard limit for interactive actions (refine, chat, validate, consistency)
+const operationalLimiter = createRateLimiter({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  maxRequests: 60, // Max 60 operations per 5 minutes per IP
+  message: 'Batas frekuensi permintaan AI terlampaui. Silakan tunggu sesaat sebelum mencoba lagi.',
+});
+
+// ============================================================================
+// GEMINI API CLIENT & SECRETS SANITIZATION
+// ============================================================================
 function getAIClient() {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY belum dikonfigurasi di environment server. Pastikan API key telah diatur di panel Secrets.');
+    throw new Error('CONFIG_MISSING_API_KEY');
   }
   return new GoogleGenAI({
     apiKey,
@@ -27,6 +97,60 @@ function getAIClient() {
         'User-Agent': 'aistudio-build',
       },
     },
+  });
+}
+
+// Sanitize logs so API keys or secrets are NEVER printed to stdout/stderr
+function redactSecrets(text: string): string {
+  if (!text) return '';
+  let sanitized = String(text);
+  const serverKey = process.env.GEMINI_API_KEY;
+  if (serverKey && serverKey.length >= 6) {
+    sanitized = sanitized.split(serverKey).join('[REDACTED_KEY]');
+  }
+  // Also mask standard Google API key patterns (AIzaSy...)
+  sanitized = sanitized.replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_KEY]');
+  return sanitized;
+}
+
+// Safe error handler that prevents exposing internal stack traces or secrets to users
+function handleAIError(error: any, res: express.Response, context: string) {
+  const rawMsg = String(error?.message || error || '');
+  console.error(`[AI Error in ${context}]`, redactSecrets(rawMsg));
+
+  if (rawMsg.includes('CONFIG_MISSING_API_KEY')) {
+    return res.status(500).json({
+      error: 'Konfigurasi Gemini API key server belum tersedia. Mohon hubungi administrator sistem.',
+    });
+  }
+
+  const lower = rawMsg.toLowerCase();
+  if (lower.includes('resource_exhausted') || lower.includes('quota') || lower.includes('429')) {
+    return res.status(429).json({
+      error: 'Layanan AI sedang menerima beban tinggi atau kuota sementara tercapai. Mohon tunggu 1-2 menit lalu coba kembali.',
+    });
+  }
+
+  if (lower.includes('safety') || lower.includes('blocked') || lower.includes('policy')) {
+    return res.status(400).json({
+      error: 'Permintaan tidak dapat diproses oleh AI karena terdeteksi kebijakan keamanan konten.',
+    });
+  }
+
+  if (lower.includes('invalid argument') || lower.includes('bad request')) {
+    return res.status(400).json({
+      error: 'Format data masukan tidak dapat diterima oleh model AI. Periksa kembali isian formulir.',
+    });
+  }
+
+  if (lower.includes('timeout') || lower.includes('deadline') || lower.includes('503') || lower.includes('econnreset') || lower.includes('fetch failed')) {
+    return res.status(503).json({
+      error: 'Koneksi ke layanan AI terputus atau batas waktu tercapai. Silakan coba sesaat lagi.',
+    });
+  }
+
+  return res.status(500).json({
+    error: 'Terjadi kendala saat memproses permintaan AI. Silakan coba kembali dalam beberapa saat.',
   });
 }
 
@@ -55,13 +179,64 @@ function safeParseJSON<T = any>(raw: string, fallback: T): T {
   }
 }
 
+// Helper input sanitizers
+function isNonEmptyString(val: any, maxLen = 5000): val is string {
+  return typeof val === 'string' && val.trim().length > 0 && val.length <= maxLen;
+}
+
+function sanitizeString(val: any, maxLen = 5000, fallback = ''): string {
+  if (typeof val !== 'string') return fallback;
+  return val.trim().slice(0, maxLen);
+}
+
+// ============================================================================
+// ENDPOINTS
+// ============================================================================
+
 // 1. Endpoint: Generate Full Learning Package
-app.post('/api/package/generate', async (req, res) => {
+app.post('/api/package/generate', packageGenerateLimiter, async (req, res) => {
   try {
     const { parameters } = req.body;
-    if (!parameters || !parameters.subject || !parameters.topic) {
-      return res.status(400).json({ error: 'Parameter pembelajaran tidak lengkap (Mata pelajaran dan topik wajib diisi).' });
+
+    // Validate parameters object
+    if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) {
+      return res.status(400).json({ error: 'Data parameter pembelajaran tidak valid (harus berupa objek).' });
     }
+
+    // Required fields validation
+    if (!isNonEmptyString(parameters.subject, 200)) {
+      return res.status(400).json({ error: 'Mata pelajaran wajib diisi (maksimal 200 karakter).' });
+    }
+    if (!isNonEmptyString(parameters.topic, 300)) {
+      return res.status(400).json({ error: 'Topik pembelajaran wajib diisi (maksimal 300 karakter).' });
+    }
+    if (!isNonEmptyString(parameters.learningObjectives, 5000)) {
+      return res.status(400).json({ error: 'Capaian dan Tujuan Pembelajaran wajib diisi (maksimal 5000 karakter).' });
+    }
+
+    // Sanitize optional fields with reasonable limits
+    const sanitizedParams = {
+      projectName: sanitizeString(parameters.projectName, 200, parameters.topic),
+      schoolName: sanitizeString(parameters.schoolName, 200, 'Madrasah Aliyah / SMA'),
+      teacherName: sanitizeString(parameters.teacherName, 200, 'Guru Mata Pelajaran'),
+      nip: sanitizeString(parameters.nip, 100, ''),
+      headmasterName: sanitizeString(parameters.headmasterName, 200, ''),
+      headmasterNip: sanitizeString(parameters.headmasterNip, 100, ''),
+      subject: sanitizeString(parameters.subject, 200),
+      level: sanitizeString(parameters.level, 100, 'MA / SMA'),
+      gradePhase: sanitizeString(parameters.gradePhase, 100, 'Fase E (Kelas 10)'),
+      semester: sanitizeString(parameters.semester, 50, 'Ganjil'),
+      topic: sanitizeString(parameters.topic, 300),
+      timeAllocation: sanitizeString(parameters.timeAllocation, 100, '2 x 45 Menit'),
+      curriculum: sanitizeString(parameters.curriculum, 150, 'Kurikulum Merdeka'),
+      learningObjectives: sanitizeString(parameters.learningObjectives, 5000),
+      studentCharacteristics: sanitizeString(parameters.studentCharacteristics, 3000, 'Reguler heterogen, variasi minat dan kemampuan'),
+      learningModel: sanitizeString(parameters.learningModel, 200, 'Problem Based Learning (PBL)'),
+      facilities: sanitizeString(parameters.facilities, 3000, 'Ruang kelas standar, papan tulis, buku pegangan siswa'),
+      assessmentTypes: sanitizeString(parameters.assessmentTypes, 3000, 'Formatif (proses) dan Sumatif (akhir)'),
+      referenceNotes: sanitizeString(parameters.referenceNotes, 3000, 'Sesuai buku ajar resmi'),
+      specialInstructions: sanitizeString(parameters.specialInstructions, 3000, 'Sajikan bahasa yang komunikatif dan terstruktur rapi'),
+    };
 
     const ai = getAIClient();
 
@@ -71,7 +246,7 @@ Tugas Anda adalah menghasilkan Paket Perangkat Pembelajaran (Modul Ajar) yang te
 PRINSIP WAJIB:
 1. KONSISTENSI VERTIKAL: Capaian dan Tujuan Pembelajaran (TP) WAJIB menjadi dasar langsung dari seluruh kegiatan pembelajaran, lembar kerja siswa (LKPD), butir soal evaluasi, dan rubrik penilaian.
 2. KONTEKSTUAL & REALISTIS: Perhatikan kondisi sarana/prasarana yang ditentukan guru (misalnya jika siswa tanpa gawai, jangan minta menggunakan aplikasi ponsel/quizizz online; gunakan media fisik/kartu/papan tulis).
-3. BAHAHSA INDONESIA BAKU & PROFESIONAL: Gunakan peristilahan Kurikulum Merdeka yang tepat (Fase, TP, KKTP, Pemantik, Asesmen Formatif/Sumatif, Profil Pelajar Pancasila / Rahmatan Lil Alamin jika madrasah).
+3. BAHASA INDONESIA BAKU & PROFESIONAL: Gunakan peristilahan Kurikulum Merdeka yang tepat (Fase, TP, KKTP, Pemantik, Asesmen Formatif/Sumatif, Profil Pelajar Pancasila / Rahmatan Lil Alamin jika madrasah).
 4. ANTI-HALUSINASI: Jangan mengarang kutipan palsu atau referensi regulasi fiktif.
 5. FORMAT TABEL MARKDOWN WAJIB: Untuk bagian "scoringRubric" (Rubrik Penilaian), "assessmentPlan" (Matriks Asesmen), dan jika ada tabel pada LKPD, WAJIB menggunakan format tabel Markdown standar (| Kolom 1 | Kolom 2 | ... | dengan pemisah |---|---|). Jangan menggunakan ASCII art border atau teks melayang tanpa tabel pipe.
 6. HINDARI SIMBOL BINTANG BERLEBIHAN: Jangan menggunakan simbol asteris/bintang liar ('*') untuk daftar poin jika bisa menggunakan penomoran runtut (1., 2., 3., a., b.) atau strip tanda hubung (-). Pastikan teks bersih dan siap diekspor menjadi dokumen resmi.
@@ -80,22 +255,22 @@ PRINSIP WAJIB:
     const userPrompt = `Buatlah Paket Perangkat Pembelajaran lengkap untuk data berikut:
 
 IDENTITAS PEMBELAJARAN:
-- Judul Proyek: ${parameters.projectName || parameters.topic}
-- Nama Sekolah/Madrasah: ${parameters.schoolName || 'Madrasah Aliyah / SMA'}
-- Nama Guru Pengampu: ${parameters.teacherName || 'Guru Mata Pelajaran'}
-- Jenjang & Kelas: ${parameters.level} - ${parameters.gradePhase}
-- Mata Pelajaran: ${parameters.subject}
-- Semester: ${parameters.semester}
-- Topik / Materi Utama: ${parameters.topic}
-- Alokasi Waktu: ${parameters.timeAllocation}
-- Kurikulum / Pendekatan: ${parameters.curriculum}
-- Capaian & Tujuan Pembelajaran Guru: ${parameters.learningObjectives}
-- Karakteristik & Kebutuhan Siswa: ${parameters.studentCharacteristics || 'Reguler heterogen, variasi minat dan kemampuan'}
-- Model Pembelajaran: ${parameters.learningModel || 'Problem Based Learning (PBL)'}
-- Fasilitas & Sarana Sekolah: ${parameters.facilities || 'Ruang kelas standar, papan tulis, buku pegangan siswa'}
-- Rencana Asesmen: ${parameters.assessmentTypes || 'Formatif (proses) dan Sumatif (akhir)'}
-- Catatan / Referensi Guru: ${parameters.referenceNotes || 'Sesuai buku ajar resmi'}
-- Instruksi Khusus Guru: ${parameters.specialInstructions || 'Sajikan bahasa yang komunikatif dan terstruktur rapi'}
+- Judul Proyek: ${sanitizedParams.projectName}
+- Nama Sekolah/Madrasah: ${sanitizedParams.schoolName}
+- Nama Guru Pengampu: ${sanitizedParams.teacherName}
+- Jenjang & Kelas: ${sanitizedParams.level} - ${sanitizedParams.gradePhase}
+- Mata Pelajaran: ${sanitizedParams.subject}
+- Semester: ${sanitizedParams.semester}
+- Topik / Materi Utama: ${sanitizedParams.topic}
+- Alokasi Waktu: ${sanitizedParams.timeAllocation}
+- Kurikulum / Pendekatan: ${sanitizedParams.curriculum}
+- Capaian & Tujuan Pembelajaran Guru: ${sanitizedParams.learningObjectives}
+- Karakteristik & Kebutuhan Siswa: ${sanitizedParams.studentCharacteristics}
+- Model Pembelajaran: ${sanitizedParams.learningModel}
+- Fasilitas & Sarana Sekolah: ${sanitizedParams.facilities}
+- Rencana Asesmen: ${sanitizedParams.assessmentTypes}
+- Catatan / Referensi Guru: ${sanitizedParams.referenceNotes}
+- Instruksi Khusus Guru: ${sanitizedParams.specialInstructions}
 
 Berikan respons dalam format JSON dengan kunci-kunci berikut (seluruh nilai berupa teks string terstruktur dengan baris baru dan penomoran rapi):
 {
@@ -103,7 +278,7 @@ Berikan respons dalam format JSON dengan kunci-kunci berikut (seluruh nilai beru
   "learningObjectivesDetail": "Rumusan Capaian Pembelajaran (CP), Alur Tujuan Pembelajaran (ATP), Tujuan Pembelajaran (TP) spesifik terukur, dan Kriteria Ketercapaian Tujuan Pembelajaran (KKTP).",
   "meaningfulUnderstanding": "1. Pemahaman Bermakna (relevansi materi dengan kehidupan nyata siswa). 2. Pertanyaan Pemantik (3-5 pertanyaan provokatif yang menumbuhkan nalar kritis siswa).",
   "coreMaterial": "Ringkasan materi pelajaran yang komprehensif, runtut secara pedagogis, menyajikan konsep inti, ilustrasi logis, fakta/hukum/dalil/teori yang benar, dan glosarium istilah penting.",
-  "learningActivities": "Langkah-langkah kegiatan pembelajaran detail dengan pembagian durasi menit: A. Pendahuluan (orientasi, apersepsi, motivasi, pemberian acuan). B. Kegiatan Inti (runtut sesuai sintaks model ${parameters.learningModel || 'PBL'}, kegiatan siswa aktif, diferensiasi). C. Penutup (simpulan bersama, refleksi, asesmen tindak lanjut).",
+  "learningActivities": "Langkah-langkah kegiatan pembelajaran detail dengan pembagian durasi menit: A. Pendahuluan (orientasi, apersepsi, motivasi, pemberian acuan). B. Kegiatan Inti (runtut sesuai sintaks model ${sanitizedParams.learningModel}, kegiatan siswa aktif, diferensiasi). C. Penutup (simpulan bersama, refleksi, asesmen tindak lanjut).",
   "studentWorksheet": "Lembar Kerja Peserta Didik (LKPD) siap pakai lengkap dengan: Judul Aktivitas, Petunjuk Pengerjaan, Stimulus Masalah/Teks/Tabel, Langkah Kerja Diskusi/Eksplorasi, Pertanyaan Analisis/Tugas, dan Kolom Kesimpulan Siswa.",
   "assessmentPlan": "Rencana Asesmen terperinci dilengkapi TABEL MATRIKS ASESMEN (| Jenis Asesmen | Teknik Penilaian | Bentuk Instrumen | Waktu Pelaksanaan |) serta penjelasan operasional diagnostik, formatif, dan sumatif.",
   "questionsAndAnswers": "Paket Soal Evaluasi Pembelajaran: 5 butir soal pilihan ganda atau esai kontekstual berjenjang (C2-C4/HOTS), dilengkapi Kunci Jawaban Resmi dan Pembahasan Rasional mendalam untuk tiap nomor.",
@@ -125,7 +300,7 @@ Berikan respons dalam format JSON dengan kunci-kunci berikut (seluruh nilai beru
     const rawText = response.text || '';
     const parsedPackage = safeParseJSON(rawText, null);
 
-    if (!parsedPackage) {
+    if (!parsedPackage || typeof parsedPackage !== 'object') {
       return res.status(500).json({ error: 'Format keluaran AI tidak valid. Silakan ulangi pembuatan.' });
     }
 
@@ -134,41 +309,51 @@ Berikan respons dalam format JSON dengan kunci-kunci berikut (seluruh nilai beru
       package: parsedPackage,
     });
   } catch (error: any) {
-    console.error('Error generating learning package:', error);
-    res.status(500).json({
-      error: error?.message || 'Terjadi kesalahan saat memproses permintaan AI.',
-    });
+    handleAIError(error, res, 'package/generate');
   }
 });
 
 // 2. Endpoint: Refine a Single Section
-app.post('/api/section/refine', async (req, res) => {
+app.post('/api/section/refine', operationalLimiter, async (req, res) => {
   try {
     const { sectionKey, sectionTitle, currentContent, instruction, parameters, learningObjectives } = req.body;
-    if (!sectionKey || !instruction) {
-      return res.status(400).json({ error: 'Data revisi seksi tidak lengkap.' });
+
+    if (!isNonEmptyString(sectionKey, 100)) {
+      return res.status(400).json({ error: 'Kunci seksi (sectionKey) wajib disertakan.' });
     }
+    if (!isNonEmptyString(instruction, 3000)) {
+      return res.status(400).json({ error: 'Instruksi revisi wajib diisi (maksimal 3000 karakter).' });
+    }
+
+    const safeTitle = sanitizeString(sectionTitle, 200, sectionKey);
+    const safeContent = sanitizeString(currentContent, 40000, '');
+    const safeInstruction = sanitizeString(instruction, 3000);
+    const safeObjectives = sanitizeString(learningObjectives, 5000, '');
+    const safeSubject = sanitizeString(parameters?.subject, 200, '-');
+    const safeGradePhase = sanitizeString(parameters?.gradePhase, 100, '-');
+    const safeTopic = sanitizeString(parameters?.topic, 300, '-');
+    const safeFacilities = sanitizeString(parameters?.facilities, 3000, 'kelas standar');
 
     const ai = getAIClient();
 
     const systemPrompt = `Anda adalah Konsultan Pembelajaran Berpengalaman yang sedang membantu guru merevisi SATU BAGIAN SPESIFIK dari Modul Ajar Kurikulum Merdeka.
 Peraturan:
-1. Ubah hanya bagian ini sesuai instruksi guru, dengan tetap menjaga keselarasan terhadap Tujuan Pembelajaran (${learningObjectives || 'terkait'}).
+1. Ubah hanya bagian ini sesuai instruksi guru, dengan tetap menjaga keselarasan terhadap Tujuan Pembelajaran (${safeObjectives || 'terkait'}).
 2. Kembalikan teks hasil revisi secara langsung, lengkap, dan rapi dalam Bahasa Indonesia yang baik tanpa meta-komentar pembuka seperti "Tentu, ini hasil revisinya".
-3. Perhatikan sarana prasarana sekolah (${parameters?.facilities || 'kelas standar'}).`;
+3. Perhatikan sarana prasarana sekolah (${safeFacilities}).`;
 
     const userPrompt = `KONTEKS PEMBELAJARAN:
-- Mata Pelajaran: ${parameters?.subject}
-- Kelas/Jenjang: ${parameters?.gradePhase}
-- Topik: ${parameters?.topic}
-- Tujuan Pembelajaran Inti: ${learningObjectives}
-- Bagian yang direvisi: ${sectionTitle || sectionKey}
+- Mata Pelajaran: ${safeSubject}
+- Kelas/Jenjang: ${safeGradePhase}
+- Topik: ${safeTopic}
+- Tujuan Pembelajaran Inti: ${safeObjectives}
+- Bagian yang direvisi: ${safeTitle}
 
 KONTEN SAAT INI:
-${currentContent}
+${safeContent}
 
 INSTRUKSI PERBAIKAN DARI GURU:
-"${instruction}"
+"${safeInstruction}"
 
 Silakan tulis ulang seluruh konten bagian ini dengan menerapkan instruksi di atas secara sempurna, terstruktur, dan bernalar pedagogis:`;
 
@@ -186,25 +371,34 @@ Silakan tulis ulang seluruh konten bagian ini dengan menerapkan instruksi di ata
       updatedContent: response.text || '',
     });
   } catch (error: any) {
-    console.error('Error refining section:', error);
-    res.status(500).json({
-      error: error?.message || 'Gagal merevisi bagian ini.',
-    });
+    handleAIError(error, res, 'section/refine');
   }
 });
 
-// 2b. Endpoint: Background Validation Helper (Reviews Lesson Plan against Learning Objectives)
-app.post('/api/section/validate-alignment', async (req, res) => {
+// 3. Endpoint: Background Validation Helper (Reviews Lesson Plan against Learning Objectives)
+app.post('/api/section/validate-alignment', operationalLimiter, async (req, res) => {
   try {
     const { sectionKey, sectionTitle, sectionContent, learningObjectives, parameters } = req.body;
-    if (!sectionContent || !learningObjectives) {
-      return res.status(400).json({ error: 'Data konten seksi dan tujuan pembelajaran dibutuhkan.' });
+
+    if (!isNonEmptyString(sectionContent, 40000) || sectionContent.trim().length < 5) {
+      return res.status(400).json({ error: 'Konten seksi wajib diisi untuk divalidasi.' });
     }
+    if (!isNonEmptyString(learningObjectives, 5000) || learningObjectives.trim().length < 5) {
+      return res.status(400).json({ error: 'Tujuan pembelajaran acuan wajib disertakan.' });
+    }
+
+    const safeKey = sanitizeString(sectionKey, 100, 'section');
+    const safeTitle = sanitizeString(sectionTitle, 200, safeKey);
+    const safeContent = sanitizeString(sectionContent, 20000);
+    const safeObjectives = sanitizeString(learningObjectives, 5000);
+    const safeSubject = sanitizeString(parameters?.subject, 200, '-');
+    const safeTopic = sanitizeString(parameters?.topic, 300, '-');
+    const safeGradePhase = sanitizeString(parameters?.gradePhase, 100, '-');
 
     const ai = getAIClient();
 
     const systemPrompt = `Anda adalah Auditor Keselarasan Kurikulum Merdeka Indonesia (Pedagogical Alignment Validator).
-Tugas Anda: tinjau secara kritis apakah draf/pembaruan seksi "${sectionTitle || sectionKey}" ini tetap SELARAS dan MENDUKUNG Capaian serta Tujuan Pembelajaran (TP) yang ditetapkan guru, ataukah terjadi "Alignment Drift" (pergeseran fokus, penyempitan kognitif, atau penyimpangan materi yang tidak mendukung TP).
+Tugas Anda: tinjau secara kritis apakah draf/pembaruan seksi "${safeTitle}" ini tetap SELARAS dan MENDUKUNG Capaian serta Tujuan Pembelajaran (TP) yang ditetapkan guru, ataukah terjadi "Alignment Drift" (pergeseran fokus, penyempitan kognitif, atau penyimpangan materi yang tidak mendukung TP).
 
 KRITERIA EVALUASI:
 1. Relevansi Inti: Apakah konten langsung memfasilitasi pencapaian TP?
@@ -224,15 +418,15 @@ Format Keluaran WAJIB JSON murni:
     const userPrompt = `Lakukan audit keselarasan cepat untuk seksi berikut terhadap Tujuan Pembelajaran:
 
 IDENTITAS:
-- Mata Pelajaran: ${parameters?.subject || '-'}
-- Topik/Materi: ${parameters?.topic || '-'}
-- Fase/Kelas: ${parameters?.gradePhase || '-'}
+- Mata Pelajaran: ${safeSubject}
+- Topik/Materi: ${safeTopic}
+- Fase/Kelas: ${safeGradePhase}
 
 [TUJUAN PEMBELAJARAN (TP) ACUAN]:
-${learningObjectives}
+${safeObjectives}
 
-[KONTEN SEKSI "${sectionTitle || sectionKey}" YANG DIPERIKSA]:
-${typeof sectionContent === 'string' ? sectionContent.slice(0, 4500) : ''}
+[KONTEN SEKSI "${safeTitle}" YANG DIPERIKSA]:
+${safeContent}
 
 Periksa apakah konten seksi ini selaras dengan TP atau terjadi drift. Output JSON murni:`;
 
@@ -260,24 +454,38 @@ Periksa apakah konten seksi ini selaras dengan TP atau terjadi drift. Output JSO
         driftMessage: parsed.driftMessage || (isAligned ? 'Seksi ini selaras dengan Tujuan Pembelajaran.' : 'Terdeteksi pergeseran dari Tujuan Pembelajaran.'),
         driftedPoints: Array.isArray(parsed.driftedPoints) ? parsed.driftedPoints : [],
         suggestedRemedy: parsed.suggestedRemedy || '',
-        sectionKey,
-        sectionTitle: sectionTitle || sectionKey,
+        sectionKey: safeKey,
+        sectionTitle: safeTitle,
         checkedAt: Date.now(),
       },
     });
   } catch (error: any) {
-    console.error('Error validating alignment:', error);
-    res.status(500).json({ error: error?.message || 'Gagal memvalidasi keselarasan seksi.' });
+    handleAIError(error, res, 'section/validate-alignment');
   }
 });
 
-// 3. Endpoint: Check Consistency Between Components
-app.post('/api/package/consistency', async (req, res) => {
+// 4. Endpoint: Check Consistency Between Components
+app.post('/api/package/consistency', operationalLimiter, async (req, res) => {
   try {
     const { parameters, package: learningPackage } = req.body;
-    if (!parameters || !learningPackage) {
-      return res.status(400).json({ error: 'Data paket tidak lengkap untuk dianalisis.' });
+
+    if (!parameters || typeof parameters !== 'object') {
+      return res.status(400).json({ error: 'Parameter pembelajaran wajib disertakan.' });
     }
+    if (!learningPackage || typeof learningPackage !== 'object') {
+      return res.status(400).json({ error: 'Paket pembelajaran (package) wajib disertakan.' });
+    }
+
+    const safeSubject = sanitizeString(parameters.subject, 200, 'Mata Pelajaran');
+    const safeTopic = sanitizeString(parameters.topic, 300, 'Topik');
+    const safeTime = sanitizeString(parameters.timeAllocation, 100, '-');
+    const safeFacilities = sanitizeString(parameters.facilities, 2000, '-');
+
+    const tp = sanitizeString(learningPackage.learningObjectivesDetail || parameters.learningObjectives, 10000, '-');
+    const activities = sanitizeString(learningPackage.learningActivities, 15000, '-');
+    const lkpd = sanitizeString(learningPackage.studentWorksheet, 15000, '-');
+    const qa = sanitizeString(learningPackage.questionsAndAnswers, 15000, '-');
+    const rubric = sanitizeString(learningPackage.scoringRubric, 15000, '-');
 
     const ai = getAIClient();
 
@@ -329,25 +537,25 @@ Format Keluaran wajib JSON murni:
 }`;
 
     const userPrompt = `Periksa keselarasan dokumen berikut:
-Mata Pelajaran: ${parameters.subject}
-Topik: ${parameters.topic}
-Alokasi Waktu: ${parameters.timeAllocation}
-Sarpras: ${parameters.facilities}
+Mata Pelajaran: ${safeSubject}
+Topik: ${safeTopic}
+Alokasi Waktu: ${safeTime}
+Sarpras: ${safeFacilities}
 
 [TUJUAN PEMBELAJARAN]:
-${learningPackage.learningObjectivesDetail || parameters.learningObjectives}
+${tp}
 
 [RANCANGAN KEGIATAN]:
-${learningPackage.learningActivities}
+${activities}
 
 [LKPD]:
-${learningPackage.studentWorksheet}
+${lkpd}
 
 [SOAL EVALUASI]:
-${learningPackage.questionsAndAnswers}
+${qa}
 
 [RUBRIK PENILAIAN]:
-${learningPackage.scoringRubric}`;
+${rubric}`;
 
     const response = await ai.models.generateContent({
       model: 'gemini-3.8-flash',
@@ -374,27 +582,33 @@ ${learningPackage.scoringRubric}`;
       },
     });
   } catch (error: any) {
-    console.error('Error checking consistency:', error);
-    res.status(500).json({
-      error: error?.message || 'Gagal memeriksa konsistensi modul.',
-    });
+    handleAIError(error, res, 'package/consistency');
   }
 });
 
-// 4. Endpoint: Contextual Assistant Chat
-app.post('/api/assistant/chat', async (req, res) => {
+// 5. Endpoint: Contextual Assistant Chat
+app.post('/api/assistant/chat', operationalLimiter, async (req, res) => {
   try {
-    const { message, activeSection, parameters, currentSectionContent, chatHistory } = req.body;
-    if (!message) {
-      return res.status(400).json({ error: 'Pesan guru tidak boleh kosong.' });
+    const { message, activeSection, parameters, currentSectionContent } = req.body;
+
+    if (!isNonEmptyString(message, 3000)) {
+      return res.status(400).json({ error: 'Pesan guru tidak boleh kosong (maksimal 3000 karakter).' });
     }
+
+    const safeMessage = sanitizeString(message, 3000);
+    const safeSection = sanitizeString(activeSection, 100, 'Semua Bagian');
+    const safeSubject = sanitizeString(parameters?.subject, 200, 'Umum');
+    const safeTopic = sanitizeString(parameters?.topic, 300, 'Umum');
+    const safeGradePhase = sanitizeString(parameters?.gradePhase, 100, '');
+    const safeFacilities = sanitizeString(parameters?.facilities, 3000, 'Kelas standar');
+    const safeContent = sanitizeString(currentSectionContent, 10000, '(Belum ada teks)');
 
     const ai = getAIClient();
 
     const systemPrompt = `Anda adalah Asisten AI Pedagogis di dalam GuruAI Studio yang mendampingi guru menyusun Modul Ajar.
-Guru sedang membuka bagian: "${activeSection || 'Semua Bagian'}".
-Mata Pelajaran: ${parameters?.subject || 'Umum'} - Topik: ${parameters?.topic || 'Umum'} (${parameters?.gradePhase || ''}).
-Fasilitas Sekolah: ${parameters?.facilities || 'Kelas standar'}.
+Guru sedang membuka bagian: "${safeSection}".
+Mata Pelajaran: ${safeSubject} - Topik: ${safeTopic} (${safeGradePhase}).
+Fasilitas Sekolah: ${safeFacilities}.
 
 Karakter Anda:
 - Ramah, hormat, solutif, dan mengedepankan kepraktisan bagi guru di kelas.
@@ -402,13 +616,13 @@ Karakter Anda:
 - Jika guru meminta perubahan atau penulisan teks baru untuk bagian yang sedang dibuka, sediakan draf siap pakai yang dapat langsung disalin atau diterapkan oleh guru.
 - Gunakan Bahasa Indonesia yang santun, lugas, dan berbobot edukatif.`;
 
-    const userPrompt = `BAGIAN YANG SEDANG DIBUKA GURU (${activeSection}):
+    const userPrompt = `BAGIAN YANG SEDANG DIBUKA GURU (${safeSection}):
 """
-${currentSectionContent ? currentSectionContent.slice(0, 3000) : '(Belum ada teks)'}
+${safeContent}
 """
 
 PERTANYAAN / INSTRUKSI GURU:
-"${message}"`;
+"${safeMessage}"`;
 
     const response = await ai.models.generateContent({
       model: 'gemini-3.8-flash',
@@ -424,10 +638,7 @@ PERTANYAAN / INSTRUKSI GURU:
       reply: response.text || '',
     });
   } catch (error: any) {
-    console.error('Error in assistant chat:', error);
-    res.status(500).json({
-      error: error?.message || 'Asisten AI mengalami kendala saat merespons.',
-    });
+    handleAIError(error, res, 'assistant/chat');
   }
 });
 
@@ -462,6 +673,6 @@ async function startServer() {
 }
 
 startServer().catch((err) => {
-  console.error('Failed to start server:', err);
+  console.error('Failed to start server:', redactSecrets(String(err?.message || err)));
   process.exit(1);
 });
