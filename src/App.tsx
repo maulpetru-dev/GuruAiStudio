@@ -16,7 +16,15 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [generationStepMessage, setGenerationStepMessage] = useState<string>('');
   const [isGuideOpen, setIsGuideOpen] = useState<boolean>(false);
+  const [toastNotification, setToastNotification] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const showToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    setToastNotification({ message, type });
+    setTimeout(() => {
+      setToastNotification((prev) => (prev?.message === message ? null : prev));
+    }, 4500);
+  };
 
   // Load projects from storage on initial mount
   useEffect(() => {
@@ -93,8 +101,9 @@ export default function App() {
   const handleExportDocx = async (project: LearningProject) => {
     try {
       await exportProjectToDocx(project);
+      showToast('Dokumen Word berhasil diekspor dan diunduh.', 'success');
     } catch (err: any) {
-      alert('Gagal mengekspor dokumen Word: ' + (err?.message || 'Terjadi kesalahan sistem'));
+      showToast('Gagal mengekspor dokumen Word: ' + (err?.message || 'Terjadi kesalahan sistem'), 'error');
     }
   };
 
@@ -107,6 +116,7 @@ export default function App() {
     a.download = `Cadangan_GuruAI_Studio_${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
+    showToast('Cadangan proyek berhasil diunduh (JSON).', 'success');
   };
 
   const handleImportBackup = () => {
@@ -122,7 +132,7 @@ export default function App() {
       const content = event.target?.result as string;
       if (content) {
         const result = storageService.importBackupJson(content);
-        alert(result.message);
+        showToast(result.message, result.success ? 'success' : 'error');
         refreshProjects();
       }
     };
@@ -199,6 +209,35 @@ export default function App() {
           />
         )}
       </div>
+
+      {/* Floating In-App Toast Notification */}
+      {toastNotification && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-20 md:bottom-6 right-4 sm:right-6 z-50 max-w-sm rounded-2xl bg-white p-4 shadow-xl border border-slate-200 flex items-start gap-3 transition-all transform animate-in fade-in slide-in-from-bottom-2 duration-200"
+        >
+          <div
+            className={`h-2.5 w-2.5 rounded-full mt-1.5 shrink-0 ${
+              toastNotification.type === 'success'
+                ? 'bg-emerald-500 ring-4 ring-emerald-100'
+                : toastNotification.type === 'error'
+                ? 'bg-rose-500 ring-4 ring-rose-100'
+                : 'bg-teal-500 ring-4 ring-teal-100'
+            }`}
+          />
+          <div className="flex-1 text-xs text-slate-800 font-medium leading-relaxed">
+            {toastNotification.message}
+          </div>
+          <button
+            onClick={() => setToastNotification(null)}
+            className="text-slate-400 hover:text-slate-600 transition-colors p-0.5 rounded cursor-pointer"
+            aria-label="Tutup notifikasi"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Quick Pedagogical Guide Modal */}
       <QuickGuideModal isOpen={isGuideOpen} onClose={() => setIsGuideOpen(false)} />

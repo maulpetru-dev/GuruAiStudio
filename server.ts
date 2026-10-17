@@ -30,6 +30,31 @@ function getAIClient() {
   });
 }
 
+// Utility helper to safely parse JSON from Gemini responses even with markdown blocks or leading text
+function safeParseJSON<T = any>(raw: string, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const stripped = raw
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/```\s*$/g, '')
+      .trim();
+    try {
+      return JSON.parse(stripped);
+    } catch {
+      const start = stripped.indexOf('{');
+      const end = stripped.lastIndexOf('}');
+      if (start !== -1 && end !== -1 && end > start) {
+        try {
+          return JSON.parse(stripped.slice(start, end + 1));
+        } catch {}
+      }
+      return fallback;
+    }
+  }
+}
+
 // 1. Endpoint: Generate Full Learning Package
 app.post('/api/package/generate', async (req, res) => {
   try {
@@ -46,7 +71,7 @@ Tugas Anda adalah menghasilkan Paket Perangkat Pembelajaran (Modul Ajar) yang te
 PRINSIP WAJIB:
 1. KONSISTENSI VERTIKAL: Capaian dan Tujuan Pembelajaran (TP) WAJIB menjadi dasar langsung dari seluruh kegiatan pembelajaran, lembar kerja siswa (LKPD), butir soal evaluasi, dan rubrik penilaian.
 2. KONTEKSTUAL & REALISTIS: Perhatikan kondisi sarana/prasarana yang ditentukan guru (misalnya jika siswa tanpa gawai, jangan minta menggunakan aplikasi ponsel/quizizz online; gunakan media fisik/kartu/papan tulis).
-3. BAHASA INDONESIA BAKU & PROFESIONAL: Gunakan peristilahan Kurikulum Merdeka yang tepat (Fase, TP, KKTP, Pemantik, Asesmen Formatif/Sumatif, Profil Pelajar Pancasila / Rahmatan Lil Alamin jika madrasah).
+3. BAHAHSA INDONESIA BAKU & PROFESIONAL: Gunakan peristilahan Kurikulum Merdeka yang tepat (Fase, TP, KKTP, Pemantik, Asesmen Formatif/Sumatif, Profil Pelajar Pancasila / Rahmatan Lil Alamin jika madrasah).
 4. ANTI-HALUSINASI: Jangan mengarang kutipan palsu atau referensi regulasi fiktif.
 5. FORMAT TABEL MARKDOWN WAJIB: Untuk bagian "scoringRubric" (Rubrik Penilaian), "assessmentPlan" (Matriks Asesmen), dan jika ada tabel pada LKPD, WAJIB menggunakan format tabel Markdown standar (| Kolom 1 | Kolom 2 | ... | dengan pemisah |---|---|). Jangan menggunakan ASCII art border atau teks melayang tanpa tabel pipe.
 6. HINDARI SIMBOL BINTANG BERLEBIHAN: Jangan menggunakan simbol asteris/bintang liar ('*') untuk daftar poin jika bisa menggunakan penomoran runtut (1., 2., 3., a., b.) atau strip tanda hubung (-). Pastikan teks bersih dan siap diekspor menjadi dokumen resmi.
@@ -98,13 +123,10 @@ Berikan respons dalam format JSON dengan kunci-kunci berikut (seluruh nilai beru
     });
 
     const rawText = response.text || '';
-    let parsedPackage;
-    try {
-      parsedPackage = JSON.parse(rawText);
-    } catch {
-      // If wrapped in markdown json block
-      const cleanJson = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
-      parsedPackage = JSON.parse(cleanJson);
+    const parsedPackage = safeParseJSON(rawText, null);
+
+    if (!parsedPackage) {
+      return res.status(500).json({ error: 'Format keluaran AI tidak valid. Silakan ulangi pembuatan.' });
     }
 
     res.json({
@@ -168,6 +190,84 @@ Silakan tulis ulang seluruh konten bagian ini dengan menerapkan instruksi di ata
     res.status(500).json({
       error: error?.message || 'Gagal merevisi bagian ini.',
     });
+  }
+});
+
+// 2b. Endpoint: Background Validation Helper (Reviews Lesson Plan against Learning Objectives)
+app.post('/api/section/validate-alignment', async (req, res) => {
+  try {
+    const { sectionKey, sectionTitle, sectionContent, learningObjectives, parameters } = req.body;
+    if (!sectionContent || !learningObjectives) {
+      return res.status(400).json({ error: 'Data konten seksi dan tujuan pembelajaran dibutuhkan.' });
+    }
+
+    const ai = getAIClient();
+
+    const systemPrompt = `Anda adalah Auditor Keselarasan Kurikulum Merdeka Indonesia (Pedagogical Alignment Validator).
+Tugas Anda: tinjau secara kritis apakah draf/pembaruan seksi "${sectionTitle || sectionKey}" ini tetap SELARAS dan MENDUKUNG Capaian serta Tujuan Pembelajaran (TP) yang ditetapkan guru, ataukah terjadi "Alignment Drift" (pergeseran fokus, penyempitan kognitif, atau penyimpangan materi yang tidak mendukung TP).
+
+KRITERIA EVALUASI:
+1. Relevansi Inti: Apakah konten langsung memfasilitasi pencapaian TP?
+2. Kedalaman Kognitif: Apakah taraf berpikir (LOTS/HOTS/C2-C4) sesuai dengan target indikator TP?
+3. Indikasi Drift: Deteksi jika materi melebar ke topik lain, instruksi tugas tidak mengukur TP, atau ada komponen TP penting yang terabaikan.
+
+Format Keluaran WAJIB JSON murni:
+{
+  "isAligned": boolean (true jika selaras dengan skor >= 70, false jika terdeteksi penyimpangan/drift),
+  "driftScore": number (skala 0 - 100: 85-100 = Sangat Selaras, 70-84 = Selaras dengan sedikit catatan, < 70 = Terjadi Drift/Penyimpangan),
+  "status": "aligned" | "warning" | "drifted",
+  "driftMessage": "Ringkasan evaluasi keselarasan 1-2 kalimat lugas dalam Bahasa Indonesia.",
+  "driftedPoints": ["Poin spesifik 1 yang bergeser atau belum sesuai TP", ...],
+  "suggestedRemedy": "Saran instruksi konkret untuk guru/AI guna mengembalikan keselarasan seksi ini dengan TP."
+}`;
+
+    const userPrompt = `Lakukan audit keselarasan cepat untuk seksi berikut terhadap Tujuan Pembelajaran:
+
+IDENTITAS:
+- Mata Pelajaran: ${parameters?.subject || '-'}
+- Topik/Materi: ${parameters?.topic || '-'}
+- Fase/Kelas: ${parameters?.gradePhase || '-'}
+
+[TUJUAN PEMBELAJARAN (TP) ACUAN]:
+${learningObjectives}
+
+[KONTEN SEKSI "${sectionTitle || sectionKey}" YANG DIPERIKSA]:
+${typeof sectionContent === 'string' ? sectionContent.slice(0, 4500) : ''}
+
+Periksa apakah konten seksi ini selaras dengan TP atau terjadi drift. Output JSON murni:`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: userPrompt,
+      config: {
+        systemInstruction: systemPrompt,
+        responseMimeType: 'application/json',
+        temperature: 0.2,
+      },
+    });
+
+    const parsed: any = safeParseJSON(response.text || '{}', {});
+    const score = typeof parsed.driftScore === 'number' ? parsed.driftScore : 85;
+    const isAligned = parsed.isAligned !== undefined ? Boolean(parsed.isAligned) : score >= 70;
+    const status = parsed.status || (score < 70 ? 'drifted' : score < 85 ? 'warning' : 'aligned');
+
+    res.json({
+      success: true,
+      result: {
+        isAligned,
+        driftScore: score,
+        status,
+        driftMessage: parsed.driftMessage || (isAligned ? 'Seksi ini selaras dengan Tujuan Pembelajaran.' : 'Terdeteksi pergeseran dari Tujuan Pembelajaran.'),
+        driftedPoints: Array.isArray(parsed.driftedPoints) ? parsed.driftedPoints : [],
+        suggestedRemedy: parsed.suggestedRemedy || '',
+        sectionKey,
+        sectionTitle: sectionTitle || sectionKey,
+        checkedAt: Date.now(),
+      },
+    });
+  } catch (error: any) {
+    console.error('Error validating alignment:', error);
+    res.status(500).json({ error: error?.message || 'Gagal memvalidasi keselarasan seksi.' });
   }
 });
 
@@ -260,12 +360,10 @@ ${learningPackage.scoringRubric}`;
     });
 
     const rawText = response.text || '';
-    let parsedReport;
-    try {
-      parsedReport = JSON.parse(rawText);
-    } catch {
-      const cleanJson = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
-      parsedReport = JSON.parse(cleanJson);
+    const parsedReport: any = safeParseJSON(rawText, null);
+
+    if (!parsedReport || typeof parsedReport !== 'object') {
+      return res.status(500).json({ error: 'Gagal menganalisis konsistensi modul (respons AI tidak valid).' });
     }
 
     res.json({

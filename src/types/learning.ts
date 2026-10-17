@@ -49,6 +49,18 @@ export interface ConsistencyReport {
   checkedAt: number;
 }
 
+export interface AlignmentValidationResult {
+  isAligned: boolean;
+  driftScore: number; // 0 - 100 (100 = perfectly aligned, < 70 = drifted)
+  status: 'aligned' | 'warning' | 'drifted';
+  driftMessage: string;
+  driftedPoints?: string[];
+  suggestedRemedy?: string;
+  sectionKey: keyof LearningPackage;
+  sectionTitle: string;
+  checkedAt: number;
+}
+
 export interface LearningProject {
   id: string;
   title: string;

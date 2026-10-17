@@ -36,7 +36,8 @@ import {
   LearningPackage,
   SECTION_METADATA,
   ConsistencyReport,
-  AssistantChatMessage
+  AssistantChatMessage,
+  AlignmentValidationResult
 } from '../types/learning';
 import { ApiService } from '../services/apiService';
 import { DocumentPreview } from './DocumentPreview';
@@ -97,28 +98,124 @@ export const WorkspaceEditor: React.FC<WorkspaceEditorProps> = ({
 
   const activeIndex = sectionKeys.indexOf(activeKey);
 
+  // Background validation helper state
+  const [isValidatingAlignment, setIsValidatingAlignment] = useState<boolean>(false);
+  const [alignmentDriftAlert, setAlignmentDriftAlert] = useState<AlignmentValidationResult | null>(null);
+  const [dismissedAlert, setDismissedAlert] = useState<boolean>(false);
+  const [sectionValidationMap, setSectionValidationMap] = useState<Record<string, AlignmentValidationResult>>({});
+  const validationAbortControllerRef = useRef<AbortController | null>(null);
+  const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  /**
+   * Background validation helper: reviews the updated lesson plan section
+   * against the learning objectives to detect alignment drift without blocking the user.
+   */
+  const runBackgroundValidation = async (key: keyof LearningPackage, content: string) => {
+    if (!content || content.trim().length < 30) return;
+
+    if (validationAbortControllerRef.current) {
+      validationAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    validationAbortControllerRef.current = controller;
+
+    setIsValidatingAlignment(true);
+
+    try {
+      const objectives =
+        project.package.learningObjectivesDetail || project.parameters.learningObjectives || '';
+
+      const result = await ApiService.validateSectionAlignment(
+        key,
+        SECTION_METADATA[key].title,
+        content,
+        objectives,
+        project.parameters,
+        controller.signal
+      );
+
+      if (controller.signal.aborted) return;
+
+      setSectionValidationMap((prev) => ({
+        ...prev,
+        [key]: result,
+      }));
+
+      // Alert user if alignment drifts or requires warning
+      if (!result.isAligned || result.status === 'drifted' || result.status === 'warning') {
+        setAlignmentDriftAlert(result);
+        setDismissedAlert(false);
+      } else {
+        // Clear alert if current section was previously drifting but is now aligned
+        setAlignmentDriftAlert((prev) => (prev?.sectionKey === key ? null : prev));
+      }
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        console.warn('Background alignment validation notice:', err);
+      }
+    } finally {
+      if (!controller.signal.aborted) {
+        setIsValidatingAlignment(false);
+      }
+    }
+  };
+
   // Sync content when active section changes
   useEffect(() => {
-    setActiveContent(project.package[activeKey] || '');
+    const sectionContent = project.package[activeKey] || '';
+    setActiveContent(sectionContent);
     setIsDirty(false);
     setSaveStatus('saved');
+
+    // Sync active alert if already validated for this section
+    if (sectionValidationMap[activeKey]) {
+      const val = sectionValidationMap[activeKey];
+      if (!val.isAligned || val.status === 'drifted' || val.status === 'warning') {
+        setAlignmentDriftAlert(val);
+        setDismissedAlert(false);
+      } else {
+        setAlignmentDriftAlert(null);
+      }
+    } else if (sectionContent.trim().length >= 40) {
+      // Run background validation on initial view
+      runBackgroundValidation(activeKey, sectionContent);
+    }
   }, [activeKey, project.id]);
 
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages, drawerMode]);
 
+  useEffect(() => {
+    return () => {
+      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+      if (validationAbortControllerRef.current) validationAbortControllerRef.current.abort();
+    };
+  }, []);
+
   const handleContentChange = (newVal: string) => {
     setActiveContent(newVal);
     setIsDirty(true);
     setSaveStatus('dirty');
+
+    // Debounce background alignment validation after teacher finishes typing
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+    debounceTimerRef.current = setTimeout(() => {
+      runBackgroundValidation(activeKey, newVal);
+    }, 2500);
   };
 
   const handleSaveContent = () => {
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
     setSaveStatus('saving');
     onUpdateSection(activeKey, activeContent);
     setIsDirty(false);
     setSaveStatus('saved');
+
+    // Immediately trigger background alignment validation on section update
+    runBackgroundValidation(activeKey, activeContent);
   };
 
   const handleCopySection = async () => {
@@ -152,6 +249,9 @@ export const WorkspaceEditor: React.FC<WorkspaceEditorProps> = ({
       setSaveStatus('saved');
       setShowRefineModal(false);
       setRefinePrompt('');
+
+      // Immediately review updated section against learning objectives
+      runBackgroundValidation(activeKey, updated);
     } catch (err: any) {
       setRefineError(err?.message || 'Gagal merevisi bagian ini.');
     } finally {
@@ -159,14 +259,17 @@ export const WorkspaceEditor: React.FC<WorkspaceEditorProps> = ({
     }
   };
 
+  const [consistencyError, setConsistencyError] = useState<string | null>(null);
+
   const handleRunConsistencyCheck = async () => {
     setIsAuditing(true);
+    setConsistencyError(null);
+    setDrawerMode('consistency');
     try {
       const report = await ApiService.checkConsistency(project.parameters, project.package);
       setConsistencyReport(report);
-      setDrawerMode('consistency');
     } catch (err: any) {
-      alert('Gagal memeriksa keselarasan: ' + (err?.message || 'Kendala jaringan'));
+      setConsistencyError(err?.message || 'Kendala jaringan saat memeriksa modul.');
     } finally {
       setIsAuditing(false);
     }
@@ -415,7 +518,20 @@ export const WorkspaceEditor: React.FC<WorkspaceEditorProps> = ({
                   </span>
 
                   <div className="min-w-0 flex-1">
-                    <span className="truncate block leading-tight">{meta.title}</span>
+                    <div className="flex items-center justify-between gap-1">
+                      <span className="truncate block leading-tight">{meta.title}</span>
+                      {sectionValidationMap[key] &&
+                        (!sectionValidationMap[key].isAligned ||
+                          sectionValidationMap[key].status === 'drifted' ||
+                          sectionValidationMap[key].status === 'warning') && (
+                          <span
+                            title="Terdeteksi pergeseran keselarasan dari TP"
+                            className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-amber-400 text-slate-950 shadow-2xs"
+                          >
+                            <AlertTriangle className="h-2.5 w-2.5" />
+                          </span>
+                        )}
+                    </div>
                     <span
                       className={`text-[10px] font-mono block mt-1 ${
                         isActive ? 'text-emerald-200' : 'text-slate-400'
@@ -434,13 +550,39 @@ export const WorkspaceEditor: React.FC<WorkspaceEditorProps> = ({
         <main className="flex-1 flex flex-col bg-slate-100 overflow-hidden">
           {/* Section Action Bar */}
           <div className="bg-white border-b border-slate-200 px-3 sm:px-6 py-2.5 sm:py-3 flex items-center justify-between gap-2 shrink-0 shadow-2xs">
-            <div className="hidden sm:flex items-center gap-3">
+            <div className="hidden sm:flex items-center gap-2.5">
               <span className="text-xs font-mono font-bold text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded">
                 Bagian {activeIndex + 1} / 11
               </span>
-              <span className="text-xs font-bold text-slate-900 truncate">
+              <span className="text-xs font-bold text-slate-900 truncate max-w-[200px] lg:max-w-none">
                 {SECTION_METADATA[activeKey].title}
               </span>
+
+              {/* Background Alignment Status Pill */}
+              {isValidatingAlignment ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-amber-50 text-amber-800 border border-amber-200 animate-pulse">
+                  <RefreshCw className="h-3 w-3 animate-spin text-amber-600" />
+                  <span className="hidden md:inline">Validasi TP...</span>
+                </span>
+              ) : alignmentDriftAlert &&
+                (!alignmentDriftAlert.isAligned ||
+                  alignmentDriftAlert.status === 'drifted' ||
+                  alignmentDriftAlert.status === 'warning') ? (
+                <button
+                  type="button"
+                  onClick={() => setDismissedAlert(false)}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-amber-100 text-amber-900 border border-amber-300 hover:bg-amber-200 transition-colors cursor-pointer shadow-2xs"
+                  title="Klik untuk membuka catatan penyimpangan keselarasan"
+                >
+                  <AlertTriangle className="h-3.5 w-3.5 text-amber-700" />
+                  <span>Keselarasan Bergeser ({alignmentDriftAlert.driftScore}/100)</span>
+                </button>
+              ) : sectionValidationMap[activeKey]?.isAligned ? (
+                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-emerald-50 text-emerald-800 border border-emerald-200">
+                  <CheckCircle2 className="h-3 w-3 text-emerald-600" />
+                  <span className="hidden md:inline">Selaras TP</span>
+                </span>
+              ) : null}
             </div>
 
             <div className="flex items-center gap-1.5 sm:gap-2 w-full sm:w-auto justify-between sm:justify-end">
@@ -478,6 +620,99 @@ export const WorkspaceEditor: React.FC<WorkspaceEditorProps> = ({
 
           {/* Paper View Container */}
           <div className="flex-1 p-3 sm:p-6 lg:p-8 overflow-y-auto">
+            {/* Alignment Drift Alert Banner */}
+            {alignmentDriftAlert &&
+              (!alignmentDriftAlert.isAligned ||
+                alignmentDriftAlert.status === 'drifted' ||
+                alignmentDriftAlert.status === 'warning') &&
+              !dismissedAlert && (
+                <div className="max-w-4xl mx-auto mb-5 rounded-2xl border-2 border-amber-300 bg-gradient-to-r from-amber-50 via-orange-50/70 to-amber-50 p-4 sm:p-5 shadow-md">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-3 flex-1 min-w-0">
+                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500 text-white shadow-sm ring-4 ring-amber-100">
+                        <AlertTriangle className="h-5 w-5" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex flex-wrap items-center gap-2 mb-1.5">
+                          <span className="text-[11px] font-black uppercase tracking-wider text-amber-900 bg-amber-200/90 px-2 py-0.5 rounded-md">
+                            Peringatan Keselarasan (Alignment Drift)
+                          </span>
+                          <span className="text-xs font-mono font-bold text-amber-950 bg-white border border-amber-300 px-2 py-0.5 rounded-md">
+                            Seksi: {alignmentDriftAlert.sectionTitle}
+                          </span>
+                          <span
+                            className={`text-xs font-mono font-extrabold px-2 py-0.5 rounded-md ${
+                              alignmentDriftAlert.driftScore < 70
+                                ? 'bg-rose-100 text-rose-900 border border-rose-300'
+                                : 'bg-amber-100 text-amber-950 border border-amber-300'
+                            }`}
+                          >
+                            Skor: {alignmentDriftAlert.driftScore}/100
+                          </span>
+                        </div>
+
+                        <p className="text-xs sm:text-sm font-bold text-slate-900 mb-2 leading-relaxed">
+                          {alignmentDriftAlert.driftMessage}
+                        </p>
+
+                        {alignmentDriftAlert.driftedPoints && alignmentDriftAlert.driftedPoints.length > 0 && (
+                          <div className="my-2.5 bg-white/90 rounded-xl p-3 border border-amber-200/80 text-xs">
+                            <span className="font-bold text-amber-950 block mb-1">
+                              Catatan Pergeseran dari Tujuan Pembelajaran:
+                            </span>
+                            <ul className="space-y-1 pl-1">
+                              {alignmentDriftAlert.driftedPoints.map((pt, pIdx) => (
+                                <li key={pIdx} className="flex items-start gap-2 text-slate-700">
+                                  <span className="text-amber-600 font-bold">•</span>
+                                  <span>{pt}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
+                        {alignmentDriftAlert.suggestedRemedy && (
+                          <div className="my-2 text-xs bg-emerald-50/90 rounded-xl p-3 border border-emerald-200 text-emerald-950">
+                            <strong className="text-emerald-900">Saran Perbaikan: </strong>
+                            <span>{alignmentDriftAlert.suggestedRemedy}</span>
+                          </div>
+                        )}
+
+                        <div className="mt-3.5 flex flex-wrap items-center gap-2 pt-2 border-t border-amber-200/60">
+                          {alignmentDriftAlert.suggestedRemedy && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setRefinePrompt(alignmentDriftAlert.suggestedRemedy || '');
+                                setShowRefineModal(true);
+                              }}
+                              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-emerald-900 text-xs font-bold text-white hover:bg-emerald-800 transition-colors shadow-xs cursor-pointer"
+                            >
+                              <Sparkles className="h-3.5 w-3.5" />
+                              <span>Perbaiki dengan AI</span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => setDrawerMode('consistency')}
+                            className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white border border-slate-300 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors cursor-pointer"
+                          >
+                            <ShieldCheck className="h-3.5 w-3.5 text-slate-600" />
+                            <span>Buka Audit Lengkap</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDismissedAlert(true)}
+                            className="px-3 py-2 rounded-xl text-xs font-medium text-slate-500 hover:text-slate-800 hover:bg-black/5 transition-colors cursor-pointer ml-auto"
+                          >
+                            Tutup Sementara
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
             {viewMode === 'preview' ? (
               <div className="max-w-4xl mx-auto bg-white rounded-3xl border border-slate-200 p-5 sm:p-8 lg:p-12 shadow-md min-h-full">
                 <DocumentPreview
@@ -653,6 +888,16 @@ export const WorkspaceEditor: React.FC<WorkspaceEditorProps> = ({
                   </button>
                 </div>
 
+                {consistencyError && (
+                  <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-xs text-rose-900 flex items-start gap-2.5">
+                    <AlertTriangle className="h-4 w-4 text-rose-600 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold block mb-0.5">Pemeriksaan Terkendala</span>
+                      <span>{consistencyError}</span>
+                    </div>
+                  </div>
+                )}
+
                 {consistencyReport ? (
                   <>
                     <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-200">
@@ -760,6 +1005,17 @@ export const WorkspaceEditor: React.FC<WorkspaceEditorProps> = ({
                         {idx + 1}
                       </span>
                       <span className="truncate">{meta.title}</span>
+                      {sectionValidationMap[key] &&
+                        (!sectionValidationMap[key].isAligned ||
+                          sectionValidationMap[key].status === 'drifted' ||
+                          sectionValidationMap[key].status === 'warning') && (
+                          <span
+                            title="Terdeteksi pergeseran keselarasan dari TP"
+                            className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-amber-400 text-slate-950 shadow-2xs"
+                          >
+                            <AlertTriangle className="h-2.5 w-2.5" />
+                          </span>
+                        )}
                     </div>
                     <span
                       className={`text-[11px] font-mono shrink-0 ${

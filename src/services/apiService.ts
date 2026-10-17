@@ -1,4 +1,4 @@
-import { LearningPackage, LearningParameters, ConsistencyReport } from '../types/learning';
+import { LearningPackage, LearningParameters, ConsistencyReport, AlignmentValidationResult } from '../types/learning';
 
 export class ApiService {
   public static async generatePackage(parameters: LearningParameters): Promise<LearningPackage> {
@@ -86,5 +86,38 @@ export class ApiService {
     }
 
     return data.reply as string;
+  }
+
+  /**
+   * Background validation helper that reviews the updated lesson plan section
+   * against the learning objectives to detect alignment drift.
+   */
+  public static async validateSectionAlignment(
+    sectionKey: keyof LearningPackage,
+    sectionTitle: string,
+    sectionContent: string,
+    learningObjectives: string,
+    parameters: LearningParameters,
+    signal?: AbortSignal
+  ): Promise<AlignmentValidationResult> {
+    const response = await fetch('/api/section/validate-alignment', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sectionKey,
+        sectionTitle,
+        sectionContent,
+        learningObjectives,
+        parameters,
+      }),
+      signal,
+    });
+
+    const data = await response.json();
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || 'Gagal memvalidasi keselarasan seksi.');
+    }
+
+    return data.result as AlignmentValidationResult;
   }
 }
