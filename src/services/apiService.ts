@@ -1,10 +1,34 @@
 import { LearningPackage, LearningParameters, ConsistencyReport, AlignmentValidationResult } from '../types/learning';
 
+let currentAuthToken: string | null = null;
+
 export class ApiService {
+  /**
+   * Set or clear the Firebase Authentication ID token.
+   * When set, all requests to the AI endpoints include Authorization: Bearer <token>.
+   */
+  public static setAuthToken(token: string | null) {
+    currentAuthToken = token;
+  }
+
+  public static getAuthToken(): string | null {
+    return currentAuthToken;
+  }
+
+  private static getHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (currentAuthToken) {
+      headers['Authorization'] = `Bearer ${currentAuthToken}`;
+    }
+    return headers;
+  }
+
   public static async generatePackage(parameters: LearningParameters): Promise<LearningPackage> {
     const response = await fetch('/api/package/generate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: ApiService.getHeaders(),
       body: JSON.stringify({ parameters }),
     });
 
@@ -26,7 +50,7 @@ export class ApiService {
   ): Promise<string> {
     const response = await fetch('/api/section/refine', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: ApiService.getHeaders(),
       body: JSON.stringify({
         sectionKey,
         sectionTitle,
@@ -51,7 +75,7 @@ export class ApiService {
   ): Promise<ConsistencyReport> {
     const response = await fetch('/api/package/consistency', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: ApiService.getHeaders(),
       body: JSON.stringify({ parameters, package: pkg }),
     });
 
@@ -71,7 +95,7 @@ export class ApiService {
   ): Promise<string> {
     const response = await fetch('/api/assistant/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: ApiService.getHeaders(),
       body: JSON.stringify({
         message,
         activeSection,
@@ -102,7 +126,7 @@ export class ApiService {
   ): Promise<AlignmentValidationResult> {
     const response = await fetch('/api/section/validate-alignment', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: ApiService.getHeaders(),
       body: JSON.stringify({
         sectionKey,
         sectionTitle,

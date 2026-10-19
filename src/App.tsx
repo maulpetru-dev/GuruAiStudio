@@ -4,20 +4,31 @@ import { DashboardView } from './components/DashboardView';
 import { BlueprintWizard } from './components/BlueprintWizard';
 import { WorkspaceEditor } from './components/WorkspaceEditor';
 import { QuickGuideModal } from './components/QuickGuideModal';
+import { AuthModal } from './components/AuthModal';
 import { LearningProject, LearningParameters, LearningPackage } from './types/learning';
 import { storageService } from './services/storageService';
 import { ApiService } from './services/apiService';
+import { authService, UserProfile } from './services/authService';
 import { exportProjectToDocx } from './services/docxExportService';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<'dashboard' | 'wizard' | 'editor'>('dashboard');
   const [projects, setProjects] = useState<LearningProject[]>([]);
   const [activeProject, setActiveProject] = useState<LearningProject | null>(null);
+  const [currentUser, setCurrentUser] = useState<UserProfile | null>(() => authService.getCurrentUser());
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [generationStepMessage, setGenerationStepMessage] = useState<string>('');
   const [isGuideOpen, setIsGuideOpen] = useState<boolean>(false);
   const [toastNotification, setToastNotification] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const unsubscribe = authService.onAuthStateChanged((user) => {
+      setCurrentUser(user);
+    });
+    return unsubscribe;
+  }, []);
 
   const showToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
     setToastNotification({ message, type });
@@ -60,7 +71,7 @@ export default function App() {
 
     try {
       const generatedPackage = await ApiService.generatePackage(params);
-      const newProject = storageService.createNewProject(params, generatedPackage);
+      const newProject = storageService.createNewProject(params, generatedPackage, currentUser?.uid);
       refreshProjects();
       setActiveProject(newProject);
       setCurrentView('editor');
@@ -174,6 +185,12 @@ export default function App() {
         onImportBackup={handleImportBackup}
         hasActiveProject={activeProject !== null}
         projectCount={projects.length}
+        currentUser={currentUser}
+        onOpenAuth={() => setIsAuthModalOpen(true)}
+        onSignOut={async () => {
+          await authService.signOut();
+          showToast('Anda telah keluar dari akun.', 'info');
+        }}
       />
 
       {/* Main Body Router */}
@@ -241,6 +258,15 @@ export default function App() {
 
       {/* Quick Pedagogical Guide Modal */}
       <QuickGuideModal isOpen={isGuideOpen} onClose={() => setIsGuideOpen(false)} />
+
+      {/* Firebase Authentication Modal */}
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => setIsAuthModalOpen(false)}
+        onSuccess={(user) => {
+          showToast(`Selamat datang, ${user.displayName || 'Guru'}! Sesi akun aktif.`, 'success');
+        }}
+      />
     </div>
   );
 }

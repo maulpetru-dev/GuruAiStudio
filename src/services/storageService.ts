@@ -376,13 +376,14 @@ class StorageService {
     return updated;
   }
 
-  public createNewProject(parameters: LearningParameters, pkg: LearningPackage): LearningProject {
+  public createNewProject(parameters: LearningParameters, pkg: LearningPackage, ownerId?: string): LearningProject {
     const newProject: LearningProject = {
       id: 'proj-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
       title: parameters.projectName || `${parameters.subject}: ${parameters.topic}`,
       createdAt: Date.now(),
       updatedAt: Date.now(),
       version: 1,
+      ownerId,
       parameters,
       package: pkg,
     };

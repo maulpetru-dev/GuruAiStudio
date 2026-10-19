@@ -66,6 +66,7 @@ export interface LearningProject {
   title: string;
   createdAt: number;
   updatedAt: number;
+  ownerId?: string; // Authenticated user ID owning this project
   parameters: LearningParameters;
   package: LearningPackage;
   consistencyReport?: ConsistencyReport;
